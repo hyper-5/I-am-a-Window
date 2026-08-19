@@ -8,5 +8,9 @@
   "name": "I am a Window",
   "developer": "C0nscious",
   "description": "Automatically moves and wraps the game window based on Player coordinates.",
-  "tags": [ "gameplay", "utility" ]
+  "tags": [ "gameplay", "utility" ],
+  "links": {
+    "homepage": "https://space.bilibili.com/3494358087108748",
+    "source": "https://github.com/hyper-5/I-am-a-Window"
+  }
 }
