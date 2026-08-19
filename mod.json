@@ -1,0 +1,12 @@
+{
+  "geode": "5.8.2",
+  "gd": {
+    "win": "2.2081"
+  },
+  "version": "v1.0.0",
+  "id": "c0nscious.i_am_a_window",
+  "name": "I am a Window",
+  "developer": "C0nscious",
+  "description": "Automatically moves and wraps the game window based on Player coordinates.",
+  "tags": [ "gameplay", "utility" ]
+}
