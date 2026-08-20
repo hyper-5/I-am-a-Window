@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
 
 #include "Config.hpp"
 #include "Projection.hpp"
@@ -15,7 +16,8 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
     struct Fields {
         HWND m_gameHwnd = nullptr;                  // 游戏主窗口句柄
         RECT m_origRect{ 0, 0, 0, 0 };              // 进入关卡前的初始窗口位置与大小
-        bool m_initialized = false;                 // 初始化完成标志
+        bool m_initialized = false;                 // 整体初始化标志
+        bool m_isPaused = false;                    // 暂停挂起状态标志
 
         int m_screenWidth = 0;                      // 物理屏幕分辨率宽
         int m_screenHeight = 0;                     // 物理屏幕分辨率高
@@ -47,7 +49,76 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         OverlayRenderer m_renderer;                 // 全屏 Direct2D 底层投影渲染器
     };
 
-    // 恢复游戏窗口至进入关卡前的原始状态与层级
+public:
+    // 1. 进入 / 恢复小窗口模式
+    void enterModWindow() {
+        if (!m_fields->m_initialized || !m_fields->m_gameHwnd) return;
+
+        m_fields->m_isPaused = false;
+
+        // 计算当前缩放目标客户区大小
+        float scale = std::clamp(g_config.windowScaleRatio, 0.01f, 1.0f);
+        m_fields->m_winWidth = static_cast<int>(std::round(static_cast<float>(m_fields->m_screenWidth) * scale));
+        m_fields->m_winHeight = static_cast<int>(std::round(static_cast<float>(m_fields->m_screenHeight) * scale));
+
+        // 重新显示 Overlay 渲染层并置顶
+        if (m_fields->m_renderer.m_overlayHwnd) {
+            ShowWindow(m_fields->m_renderer.m_overlayHwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                m_fields->m_renderer.m_overlayHwnd,
+                HWND_TOPMOST,
+                0, 0,
+                m_fields->m_screenWidth,
+                m_fields->m_screenHeight,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW
+            );
+        }
+
+        // 将主窗口置顶
+        SetWindowPos(
+            m_fields->m_gameHwnd,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+        );
+
+        SetForegroundWindow(m_fields->m_gameHwnd);
+        SetFocus(m_fields->m_gameHwnd);
+    }
+
+    // 2. 暂停挂起：还原窗口至原始全屏尺寸供操作 UI，隐藏 Overlay
+    void suspendModWindow() {
+        if (!m_fields->m_initialized || !m_fields->m_gameHwnd) return;
+
+        m_fields->m_isPaused = true;
+
+        // 隐藏 Overlay 与 2P 窗口
+        if (m_fields->m_renderer.m_overlayHwnd) {
+            ShowWindow(m_fields->m_renderer.m_overlayHwnd, SW_HIDE);
+        }
+        if (m_fields->m_renderer.m_p2Hwnd) {
+            ShowWindow(m_fields->m_renderer.m_p2Hwnd, SW_HIDE);
+        }
+
+        // 恢复主窗口至进入关卡前的原始状态与大小，取消置顶
+        int origW = m_fields->m_origRect.right - m_fields->m_origRect.left;
+        int origH = m_fields->m_origRect.bottom - m_fields->m_origRect.top;
+
+        SetWindowPos(
+            m_fields->m_gameHwnd,
+            HWND_NOTOPMOST,
+            m_fields->m_origRect.left,
+            m_fields->m_origRect.top,
+            origW,
+            origH,
+            SWP_SHOWWINDOW
+        );
+
+        SetForegroundWindow(m_fields->m_gameHwnd);
+        SetFocus(m_fields->m_gameHwnd);
+    }
+
+    // 3. 彻底退出关卡：释放渲染资源并复原窗口
     void restoreWindow() {
         m_fields->m_renderer.cleanup();
 
@@ -68,10 +139,11 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             m_fields->m_waveTrail.clear();
             m_fields->m_waveTrail2.clear();
             m_fields->m_initialized = false;
+            m_fields->m_isPaused = false;
         }
     }
 
-    // PlayLayer 初始化：计算屏幕缩放、窗口边框并初始化外挂渲染层
+    // PlayLayer 初始化
     bool init(GJGameLevel * level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             return false;
@@ -79,14 +151,14 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
 
         loadOrInitConfig();
 
-        // 1. 获取主游戏窗口句柄 (优先从 OpenGL 上下文获取)
+        // 1. 获取主游戏窗口句柄
         m_fields->m_gameHwnd = WindowFromDC(wglGetCurrentDC());
         if (!m_fields->m_gameHwnd) {
             m_fields->m_gameHwnd = FindWindowA(nullptr, "Geometry Dash");
         }
 
         if (m_fields->m_gameHwnd) {
-            // 2. 记录原始尺寸并精确测量系统标题栏/边框边距
+            // 2. 记录原始尺寸并测量系统边框边距
             GetWindowRect(m_fields->m_gameHwnd, &m_fields->m_origRect);
 
             POINT ptClientTopLeft = { 0, 0 };
@@ -102,23 +174,11 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             m_fields->m_screenWidth = GetSystemMetrics(SM_CXSCREEN);
             m_fields->m_screenHeight = GetSystemMetrics(SM_CYSCREEN);
 
-            // 3. 计算微型化窗口目标客户区大小
             float scale = std::clamp(g_config.windowScaleRatio, 0.01f, 1.0f);
             m_fields->m_winWidth = static_cast<int>(std::round(static_cast<float>(m_fields->m_screenWidth) * scale));
             m_fields->m_winHeight = static_cast<int>(std::round(static_cast<float>(m_fields->m_screenHeight) * scale));
 
-            // 4. 将主窗口置顶并缩放居中
-            SetWindowPos(
-                m_fields->m_gameHwnd,
-                HWND_TOPMOST,
-                (m_fields->m_screenWidth - m_fields->m_winWidth) / 2 - m_fields->m_borderLeft,
-                (m_fields->m_screenHeight - m_fields->m_winHeight) / 2 - m_fields->m_borderTop,
-                m_fields->m_winWidth + m_fields->m_totalBorderW,
-                m_fields->m_winHeight + m_fields->m_totalBorderH,
-                SWP_NOACTIVATE
-            );
-
-            // 5. 初始化 DirectComposition + Direct2D 透明全屏 Overlay 与 2P 窗口
+            // 3. 初始化 DirectComposition + Direct2D Overlay
             m_fields->m_renderer.init(
                 m_fields->m_gameHwnd,
                 m_fields->m_screenWidth,
@@ -130,15 +190,28 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             );
 
             m_fields->m_initialized = true;
+
+            // 4. 进入小窗口模式
+            enterModWindow();
         }
 
         return true;
     }
 
-    // 关卡重置（死亡复活/重新开始）：重置锚定状态、清空轨迹并隐藏 2P 窗口
+    // 暂停游戏 Hook
+    void pauseGame(bool p0) {
+        suspendModWindow();
+        PlayLayer::pauseGame(p0);
+    }
+
+    // 关卡重置（死亡复活 / 暂停菜单直接点 Restart）
     void resetLevel() {
         PlayLayer::resetLevel();
         if (m_fields->m_initialized) {
+            if (m_fields->m_isPaused) {
+                enterModWindow();
+            }
+
             m_fields->m_p1TargetAnchorTop = false;
             m_fields->m_p1AnchorRatio = 0.0f;
             m_fields->m_p2TargetAnchorTop = true;
@@ -147,7 +220,6 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             m_fields->m_waveTrail.clear();
             m_fields->m_waveTrail2.clear();
 
-            // 重置 Wave 状态
             m_fields->m_p1WaveDir = 0;
             m_fields->m_p1LastPos = cocos2d::CCPoint(0.0f, 0.0f);
             m_fields->m_p2WaveDir = 0;
@@ -159,12 +231,17 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         }
     }
 
-    // 每帧物理更新后逻辑：同步窗口位置、追踪 Dual 状态、采集 Wave 轨迹并提交全屏投影
+    // 每帧物理更新后逻辑
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
         if (!m_fields->m_initialized || !m_fields->m_gameHwnd || !m_player1 || !m_fields->m_renderer.isReady()) {
             return;
+        }
+
+        // 核心自愈：如果在 postUpdate 运行时仍处于挂起状态，说明刚从暂停恢复，立即切回小窗口
+        if (m_fields->m_isPaused) {
+            enterModWindow();
         }
 
         auto director = cocos2d::CCDirector::sharedDirector();
@@ -176,7 +253,6 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         float currentCameraScale = m_objectLayer ? std::abs(m_objectLayer->getScale()) : 1.0f;
         if (currentCameraScale <= 0.001f) currentCameraScale = 1.0f;
 
-        // 辅助 Lambda：获取角色全部实时缩放
         auto getAccuratePlayerScale = [](PlayerObject* player) -> float {
             if (!player) return 1.0f;
             float sy = std::abs(player->getScaleY());
@@ -193,11 +269,9 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
 
         // 2. 同步 Player 1 窗口
         if (m_player1->m_isOnGround) {
-            // 仅在接触地面/天花板帧更新目标状态
             m_fields->m_p1TargetAnchorTop = m_player1->m_isUpsideDown;
         }
 
-        //地面/天花板对准平滑过渡
         constexpr float kFastLerpSpeed = 90.0f;
         float targetRatio1 = m_fields->m_p1TargetAnchorTop ? 1.0f : 0.0f;
         m_fields->m_p1AnchorRatio += (targetRatio1 - m_fields->m_p1AnchorRatio) * std::clamp(kFastLerpSpeed * dt, 0.0f, 1.0f);
@@ -211,7 +285,6 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         int curWinW = static_cast<int>(std::round(m_fields->m_winWidth * p1TotalScale));
         int curWinH = static_cast<int>(std::round(m_fields->m_winHeight * p1TotalScale));
 
-        // 角色在屏幕上的物理半高像素投影（GD 标准半高为 15.0f）
         float p1HalfHeightDesk = 15.0f * p1Scale * pixelsPerPoint * currentCameraScale;
 
         cocos2d::CCPoint p1PhysPos = m_player1->m_position;
@@ -221,15 +294,12 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         int clientX1 = p1DeskPt.x - (curWinW / 2);
         int winX1 = clientX1 - m_fields->m_borderLeft;
 
-        // 地面触底：客户区底边贴地，标题栏向上伸展
         float winY_ground1 = static_cast<float>(p1DeskPt.y) + p1HalfHeightDesk - static_cast<float>(curWinH) - static_cast<float>(m_fields->m_borderTop);
-        // 天花板触顶：窗口顶边（状态栏最上方）贴顶，整个窗口向下挂载
         float winY_ceiling1 = static_cast<float>(p1DeskPt.y) - p1HalfHeightDesk;
 
         float finalWinY1 = (1.0f - m_fields->m_p1AnchorRatio) * winY_ground1 + m_fields->m_p1AnchorRatio * winY_ceiling1;
         int winY1 = static_cast<int>(std::round(finalWinY1));
 
-        // 极速无重绘窗口平移标志
         constexpr UINT kMotionFlags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER | SWP_NOREDRAW;
 
         SetWindowPos(
@@ -242,7 +312,7 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             kMotionFlags
         );
 
-        // 3. Dual 分裂检测与 Player 2 窗口同步
+        // 3. Dual 模式同步
         bool isDual = (m_player2 != nullptr && m_player2->getParent() != nullptr && m_player2->isVisible());
         int curWinW2 = curWinW;
         int curWinH2 = curWinH;
@@ -279,7 +349,6 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             float finalWinY2 = (1.0f - m_fields->m_p2AnchorRatio) * winY_ground2 + m_fields->m_p2AnchorRatio * winY_ceiling2;
             int p2WinY = static_cast<int>(std::round(finalWinY2));
 
-            // 显示或平移 2P 独立窗口
             if (!IsWindowVisible(m_fields->m_renderer.m_p2Hwnd)) {
                 SetWindowPos(
                     m_fields->m_renderer.m_p2Hwnd,
@@ -303,21 +372,18 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
                 );
             }
 
-            // 同步主窗口图像并执行反色渲染至 2P 窗口
             m_fields->m_renderer.renderP2Inverted(m_fields->m_gameHwnd, curWinW, curWinH, curWinW2, curWinH2);
         }
         else if (m_fields->m_renderer.m_p2Hwnd && IsWindowVisible(m_fields->m_renderer.m_p2Hwnd)) {
             ShowWindow(m_fields->m_renderer.m_p2Hwnd, SW_HIDE);
         }
 
-        // 4. Wave 轨迹记录与拐点裁剪优化
+        // 4. Wave 轨迹计算
         auto updateWaveTrail = [](std::deque<cocos2d::CCPoint>& trail, int& currentDir, cocos2d::CCPoint& lastPos, const cocos2d::CCPoint& curPos, float maxDist) {
             float dx = curPos.x - lastPos.x;
             float dy = curPos.y - lastPos.y;
 
-            // 当产生有效位移时更新
             if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
-                // 判断当前飞行方向：1 = 向上飞, -1 = 向下飞, 0 = 水平贴地面/天花板
                 int newDir = (dy > 0.05f) ? 1 : ((dy < -0.05f) ? -1 : 0);
 
                 if (trail.empty()) {
@@ -326,21 +392,18 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
                     currentDir = newDir;
                 }
                 else {
-                    // 变向瞬间（拐弯/触底触顶反弹）：将上一帧位置固化为折线拐点，开启新直线段
                     if (newDir != currentDir) {
                         trail.back() = lastPos;
                         trail.push_back(curPos);
                         currentDir = newDir;
                     }
                     else {
-                        // 同方向直线延伸：只更新活动端点，绝不插入中间稠密散点
                         trail.back() = curPos;
                     }
                 }
                 lastPos = curPos;
             }
 
-            // 平滑尾部裁剪（按像素距离对最老的线段进行插值截断）
             while (trail.size() >= 2) {
                 if (curPos.x - trail[1].x > maxDist) {
                     trail.pop_front();
@@ -365,35 +428,29 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         if (isWave) {
             updateWaveTrail(m_fields->m_waveTrail, m_fields->m_p1WaveDir, m_fields->m_p1LastPos, p1PhysPos, g_config.waveTrailMaxDist);
         }
-        else {
-            if (!m_fields->m_waveTrail.empty()) {
-                m_fields->m_waveTrail.clear();
-                m_fields->m_p1WaveDir = 0;
-            }
+        else if (!m_fields->m_waveTrail.empty()) {
+            m_fields->m_waveTrail.clear();
+            m_fields->m_p1WaveDir = 0;
         }
 
         bool isWave2 = isDual && m_player2->m_isDart;
         if (isWave2) {
             updateWaveTrail(m_fields->m_waveTrail2, m_fields->m_p2WaveDir, m_fields->m_p2LastPos, m_player2->m_position, g_config.waveTrailMaxDist);
         }
-        else {
-            if (!m_fields->m_waveTrail2.empty()) {
-                m_fields->m_waveTrail2.clear();
-                m_fields->m_p2WaveDir = 0;
-            }
+        else if (!m_fields->m_waveTrail2.empty()) {
+            m_fields->m_waveTrail2.clear();
+            m_fields->m_p2WaveDir = 0;
         }
 
-        // 5. 渲染底层投影与全屏提交
+        // 5. 提交全屏 Direct2D 渲染
         m_fields->m_renderer.beginFrame(m_fields->m_screenWidth, m_fields->m_screenHeight);
 
-        // 绘制地面与天花板
         m_fields->m_renderer.renderGroundAndCeiling(
             m_groundLayer, m_groundLayer2,
             m_objectLayer, winSize,
             m_fields->m_screenWidth, m_fields->m_screenHeight
         );
 
-        // 视口剔除并渲染关卡物块 (方块/刺/Portal/Orbs等)
         m_fields->m_renderer.renderObjects(
             m_objects,
             m_objectLayer,
@@ -403,20 +460,35 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             currentCameraScale
         );
 
-        // 绘制 Wave 模式平滑轨迹
         if (isWave || isWave2) {
             m_fields->m_renderer.updateWavePen(currentCameraScale, m_fields->m_screenHeight);
             if (isWave) m_fields->m_renderer.renderWaveTrail(m_fields->m_waveTrail, m_objectLayer, winSize, m_fields->m_screenWidth, m_fields->m_screenHeight);
             if (isWave2) m_fields->m_renderer.renderWaveTrail(m_fields->m_waveTrail2, m_objectLayer, winSize, m_fields->m_screenWidth, m_fields->m_screenHeight);
         }
 
-        // 交换链 Present 呈现画面
         m_fields->m_renderer.present(m_fields->m_screenWidth, m_fields->m_screenHeight);
     }
 
-    // 退出关卡 Hook：还原窗口大小与层级
-    void onExit() {
+    // 退出关卡 Hook
+    void onQuit() {
         restoreWindow();
-        PlayLayer::onExit();
+        PlayLayer::onQuit();
+    }
+};
+
+// Hook 挂钩 PauseLayer：保证通过任何手段点击恢复/退出时都能同步状态
+class $modify(MatryoshkaPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+        if (auto pl = PlayLayer::get()) {
+            static_cast<MatryoshkaWindowLayer*>(pl)->suspendModWindow();
+        }
+    }
+
+    void onResume(CCObject * sender) {
+        PauseLayer::onResume(sender);
+        if (auto pl = PlayLayer::get()) {
+            static_cast<MatryoshkaWindowLayer*>(pl)->enterModWindow();
+        }
     }
 };
