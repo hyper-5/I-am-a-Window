@@ -44,6 +44,7 @@ enum class FastObjectClass : uint8_t {
     Skip = 0,       // 忽略/不渲染
     Solid,          // 普通实体方块
     Slope,          // 斜坡
+    Breakable,      // 可破坏物体
     Hazard,         // 尖刺 / 齿轮
     SpeedPortal,    // 变速门
     Portal,         // Portal
@@ -427,14 +428,19 @@ public:
         auto type = obj->m_objectType;
         int id = obj->m_objectID;
 
-        // 1. 原生收集品类型通配（涵盖全部金币、银币、钥匙、拾取物等）
+        // 1. 原生可破坏物体判定（直接识别所有碎石、裂纹块、Dash可撞碎物体）
+        if (type == GameObjectType::Breakable) {
+            return FastObjectClass::Breakable;
+        }
+
+        // 2. 原生收集品类型通配（涵盖全部金币、银币、钥匙、拾取物等）
         if (type == GameObjectType::Collectible ||
             type == GameObjectType::SecretCoin ||
             type == GameObjectType::UserCoin) {
             return FastObjectClass::Collectible;
         }
 
-        // 2. 特殊 ID 备用补漏（经典金币、银币、骷髅币、拾取物等）
+        // 3. 特殊 ID 备用补漏（经典金币、银币、骷髅币、拾取物等）
         switch (id) {
         case 22: case 1329: case 1322: // Secret Coins & User Coins
         case 1611:                     // Key
@@ -554,6 +560,13 @@ public:
 
             // 依类别分发图元渲染
             switch (objClass) {
+            case FastObjectClass::Breakable: {
+                // 可破坏方块：绿色填充 + 黑色描边
+                D2D1_RECT_F blockRect = D2D1::RectF(-0.5f, -0.5f, 0.5f, 0.5f);
+                m_d2dContext->FillRectangle(blockRect, m_colGreen);
+                m_d2dContext->DrawRectangle(blockRect, m_brushOutline, strokeW);
+                break;
+            }
             case FastObjectClass::Collectible: {
                 // 收集品：带黑色描边的绿色方块
                 D2D1_RECT_F colRect = D2D1::RectF(-0.45f, -0.45f, 0.45f, 0.45f);
