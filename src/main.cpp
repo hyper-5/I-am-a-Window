@@ -37,6 +37,13 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
         std::deque<cocos2d::CCPoint> m_waveTrail;   // P1 Wave 轨迹历史点队列
         std::deque<cocos2d::CCPoint> m_waveTrail2;  // P2 Wave 轨迹历史点队列
 
+        // Wave 飞行方向与上一帧锚点
+        int m_p1WaveDir = 0; // 1 = 向上, -1 = 向下, 0 = 平移/未初始化
+        cocos2d::CCPoint m_p1LastPos{ 0.0f, 0.0f };
+
+        int m_p2WaveDir = 0;
+        cocos2d::CCPoint m_p2LastPos{ 0.0f, 0.0f };
+
         OverlayRenderer m_renderer;                 // 全屏 Direct2D 底层投影渲染器
     };
 
@@ -139,6 +146,13 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
 
             m_fields->m_waveTrail.clear();
             m_fields->m_waveTrail2.clear();
+
+            // 重置 Wave 状态
+            m_fields->m_p1WaveDir = 0;
+            m_fields->m_p1LastPos = cocos2d::CCPoint(0.0f, 0.0f);
+            m_fields->m_p2WaveDir = 0;
+            m_fields->m_p2LastPos = cocos2d::CCPoint(0.0f, 0.0f);
+
             if (m_fields->m_renderer.m_p2Hwnd) {
                 ShowWindow(m_fields->m_renderer.m_p2Hwnd, SW_HIDE);
             }
@@ -296,35 +310,77 @@ class $modify(MatryoshkaWindowLayer, PlayLayer) {
             ShowWindow(m_fields->m_renderer.m_p2Hwnd, SW_HIDE);
         }
 
-        // 4. Wave 轨迹记录与裁剪
+        // 4. Wave 轨迹记录与拐点裁剪优化
+        auto updateWaveTrail = [](std::deque<cocos2d::CCPoint>& trail, int& currentDir, cocos2d::CCPoint& lastPos, const cocos2d::CCPoint& curPos, float maxDist) {
+            float dx = curPos.x - lastPos.x;
+            float dy = curPos.y - lastPos.y;
+
+            // 当产生有效位移时更新
+            if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
+                // 判断当前飞行方向：1 = 向上飞, -1 = 向下飞, 0 = 水平贴地面/天花板
+                int newDir = (dy > 0.05f) ? 1 : ((dy < -0.05f) ? -1 : 0);
+
+                if (trail.empty()) {
+                    trail.push_back(curPos);
+                    trail.push_back(curPos);
+                    currentDir = newDir;
+                }
+                else {
+                    // 变向瞬间（拐弯/触底触顶反弹）：将上一帧位置固化为折线拐点，开启新直线段
+                    if (newDir != currentDir) {
+                        trail.back() = lastPos;
+                        trail.push_back(curPos);
+                        currentDir = newDir;
+                    }
+                    else {
+                        // 同方向直线延伸：只更新活动端点，绝不插入中间稠密散点
+                        trail.back() = curPos;
+                    }
+                }
+                lastPos = curPos;
+            }
+
+            // 平滑尾部裁剪（按像素距离对最老的线段进行插值截断）
+            while (trail.size() >= 2) {
+                if (curPos.x - trail[1].x > maxDist) {
+                    trail.pop_front();
+                }
+                else if (curPos.x - trail[0].x > maxDist) {
+                    float excess = (curPos.x - maxDist) - trail[0].x;
+                    float segDx = trail[1].x - trail[0].x;
+                    if (segDx > 0.001f) {
+                        float t = std::clamp(excess / segDx, 0.0f, 1.0f);
+                        trail[0].x = trail[0].x + t * (trail[1].x - trail[0].x);
+                        trail[0].y = trail[0].y + t * (trail[1].y - trail[0].y);
+                    }
+                    break;
+                }
+                else {
+                    break;
+                }
+            }
+            };
+
         bool isWave = m_player1->m_isDart;
         if (isWave) {
-            m_fields->m_waveTrail.push_back(p1PhysPos);
-            while (!m_fields->m_waveTrail.empty()) {
-                if (p1PhysPos.x - m_fields->m_waveTrail.front().x > g_config.waveTrailMaxDist ||
-                    static_cast<int>(m_fields->m_waveTrail.size()) > g_config.waveTrailMaxPoints) {
-                    m_fields->m_waveTrail.pop_front();
-                }
-                else break;
-            }
+            updateWaveTrail(m_fields->m_waveTrail, m_fields->m_p1WaveDir, m_fields->m_p1LastPos, p1PhysPos, g_config.waveTrailMaxDist);
         }
         else {
-            if (!m_fields->m_waveTrail.empty()) m_fields->m_waveTrail.clear();
+            if (!m_fields->m_waveTrail.empty()) {
+                m_fields->m_waveTrail.clear();
+                m_fields->m_p1WaveDir = 0;
+            }
         }
 
         bool isWave2 = isDual && m_player2->m_isDart;
         if (isWave2) {
-            m_fields->m_waveTrail2.push_back(m_player2->m_position);
-            while (!m_fields->m_waveTrail2.empty()) {
-                if (m_player2->m_position.x - m_fields->m_waveTrail2.front().x > g_config.waveTrailMaxDist ||
-                    static_cast<int>(m_fields->m_waveTrail2.size()) > g_config.waveTrailMaxPoints) {
-                    m_fields->m_waveTrail2.pop_front();
-                }
-                else break;
-            }
+            updateWaveTrail(m_fields->m_waveTrail2, m_fields->m_p2WaveDir, m_fields->m_p2LastPos, m_player2->m_position, g_config.waveTrailMaxDist);
         }
         else {
-            if (!m_fields->m_waveTrail2.empty()) m_fields->m_waveTrail2.clear();
+            if (!m_fields->m_waveTrail2.empty()) {
+                m_fields->m_waveTrail2.clear();
+                m_fields->m_p2WaveDir = 0;
+            }
         }
 
         // 5. 渲染底层投影与全屏提交
